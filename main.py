@@ -1,453 +1,456 @@
-import os
 import logging
-import sqlite3
 
-from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    filters,
 )
 
-# -------------------- تنظیمات اولیه --------------------
+from config import BOT_TOKEN, logger
+from database import initialize_database, get_connection
+from utils.helpers import register_user, is_admin, main_menu, audit
 
-load_dotenv()
+from handlers.admin import admin_panel, admin_logs
+from handlers.orders import user_orders, admin_orders
+from handlers.products import show_products, show_product
+from handlers.referrals import referrals, register_referral
+from handlers.stars import buy_with_stars, pre_checkout, successful_payment
+from handlers.support import support, handle_support_message
+from handlers.user import account, transactions
+from handlers.wallet import show_wallet
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_NAME = "vitoplus.db"
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+from services.products import (
+    get_all_products,
+    get_product_details,
+    update_product,
+    set_product_active,
+    set_product_stock,
 )
-
-logger = logging.getLogger(__name__)
-
-
-# -------------------- پایگاه داده --------------------
-
-def get_connection():
-    connection = sqlite3.connect(DATABASE_NAME)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+from services.statistics import get_dashboard_statistics
+from services.users import get_all_users, set_user_ban
+from services.admin_tools import get_active_admins
 
 
-def initialize_database():
-    with get_connection() as db:
-
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            wallet_balance INTEGER NOT NULL DEFAULT 0,
-            is_banned INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            volume_gb INTEGER NOT NULL,
-            price INTEGER NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER NOT NULL,
-            product_id INTEGER,
-            volume_gb INTEGER NOT NULL,
-            price INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
-            FOREIGN KEY (product_id) REFERENCES products(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            transaction_type TEXT NOT NULL,
-            description TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS discount_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL UNIQUE,
-            discount_type TEXT NOT NULL,
-            discount_value INTEGER NOT NULL,
-            max_uses INTEGER,
-            expires_at TEXT,
-            is_active INTEGER NOT NULL DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS discount_usages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            discount_id INTEGER NOT NULL,
-            telegram_id INTEGER NOT NULL,
-            order_id INTEGER,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(discount_id, telegram_id),
-            FOREIGN KEY (discount_id) REFERENCES discount_codes(id),
-            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
-            FOREIGN KEY (order_id) REFERENCES orders(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS payment_receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            image_file_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            admin_id INTEGER,
-            admin_note TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS support_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER NOT NULL,
-            message_text TEXT,
-            message_type TEXT,
-            file_id TEXT,
-            is_from_admin INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS required_channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id TEXT NOT NULL UNIQUE,
-            channel_name TEXT,
-            is_permanent INTEGER NOT NULL DEFAULT 0,
-            expires_at TEXT,
-            is_active INTEGER NOT NULL DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS settings (
-            setting_key TEXT PRIMARY KEY,
-            setting_value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS admins (
-            telegram_id INTEGER PRIMARY KEY,
-            role TEXT NOT NULL DEFAULT 'owner',
-            is_active INTEGER NOT NULL DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            details TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_orders_user
-        ON orders(telegram_id);
-
-        CREATE INDEX IF NOT EXISTS idx_transactions_user
-        ON transactions(telegram_id);
-
-        CREATE INDEX IF NOT EXISTS idx_receipts_status
-        ON payment_receipts(status);
-
-        CREATE INDEX IF NOT EXISTS idx_support_user
-        ON support_messages(telegram_id);
-
-        """)
-
-        # پرداخت تومانی در شروع غیرفعال است.
-        db.execute("""
-            INSERT OR IGNORE INTO settings (setting_key, setting_value)
-            VALUES ('toman_payment_enabled', '0')
-        """)
-
-        # حداکثر حجم خرید دلخواه در شروع 100 گیگابایت است.
-        db.execute("""
-            INSERT OR IGNORE INTO settings (setting_key, setting_value)
-            VALUES ('custom_volume_max', '100')
-        """)
-
-        # اعتبار همه کانفیگ‌ها 30 روز است.
-        db.execute("""
-            INSERT OR IGNORE INTO settings (setting_key, setting_value)
-            VALUES ('config_validity_days', '30')
-        """)
-
-    logger.info("Database initialized successfully.")
-
-
-# -------------------- ثبت کاربران --------------------
-
-def register_user(user):
-    with get_connection() as db:
-        db.execute("""
-            INSERT INTO users (telegram_id, username, first_name)
-            VALUES (?, ?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name
-        """, (
-            user.id,
-            user.username,
-            user.first_name
-        ))
-
-
-# -------------------- منوی اصلی --------------------
-
-def main_menu():
-    keyboard = [
-        [
-            InlineKeyboardButton("🛒 خرید کانفیگ", callback_data="buy"),
-            InlineKeyboardButton("💳 شارژ کیف پول", callback_data="wallet_charge"),
-        ],
-        [
-            InlineKeyboardButton("👛 حساب من", callback_data="account"),
-            InlineKeyboardButton("📦 خریدهای من", callback_data="orders"),
-        ],
-        [
-            InlineKeyboardButton("🧾 تراکنش‌ها", callback_data="transactions"),
-            InlineKeyboardButton("👥 دعوت دوستان", callback_data="referrals"),
-        ],
-        [
-            InlineKeyboardButton("💬 پشتیبانی", callback_data="support"),
-            InlineKeyboardButton("ℹ️ راهنمای خرید", callback_data="guide"),
-        ],
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
+# ----------------------------- Commands -----------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+
     register_user(user)
 
+    if context.args and context.args[0].startswith("ref_"):
+        try:
+            await register_referral(user.id, int(context.args[0][4:]))
+        except (TypeError, ValueError):
+            logger.info("Invalid referral argument from user %s", user.id)
+
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT is_banned FROM users WHERE telegram_id = ?",
+            (user.id,),
+        ).fetchone()
+
+    if row and row["is_banned"]:
+        await message.reply_text("⛔ حساب کاربری شما مسدود شده است.")
+        return
+
+    context.user_data.clear()
+    await message.reply_text(
+        f"سلام {user.first_name or 'دوست عزیز'}! 👋\n\n"
+        "به VitoPlus خوش اومدی.\nاز منوی زیر بخش موردنظرت رو انتخاب کن:",
+        reply_markup=main_menu(),
+    )
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await admin_panel(update, context)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "عملیات لغو شد.", reply_markup=main_menu()
+        )
+
+
+# ----------------------------- Admin screens -----------------------------
+
+async def show_admin_products(message):
+    products = get_all_products()
+    if not products:
+        await message.reply_text(
+            "هنوز محصولی ثبت نشده است.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")
+            ]]),
+        )
+        return
+
+    rows = []
+    for product in products[:40]:
+        status = "🟢" if product["is_active"] else "⚪"
+        rows.append([InlineKeyboardButton(
+            f"{status} {product['name']} | {product['volume_gb']}GB",
+            callback_data=f"admin_product_{product['id']}",
+        )])
+    rows.append([InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")])
+    await message.reply_text("📦 مدیریت محصولات\nمحصول موردنظر را انتخاب کن:",
+                             reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_admin_product(message, product_id):
+    product = get_product_details(product_id)
+    if not product:
+        await message.reply_text("محصول پیدا نشد.")
+        return
+
+    status = "فعال" if product["is_active"] else "غیرفعال"
     text = (
-        f"سلام {user.first_name} عزیز! ❤️\n\n"
-        "به ربات VitoPlus خوش اومدی.\n"
-        "از منوی زیر می‌تونی خدمات موردنظرت رو انتخاب کنی."
+        f"📦 {product['name']}\n\n"
+        f"شناسه: {product['id']}\n"
+        f"نوع: {product['product_type']}\n"
+        f"حجم: {product['volume_gb']} گیگابایت\n"
+        f"قیمت تومانی: {product['price']:,}\n"
+        f"قیمت Stars: {product['stars_price']}\n"
+        f"موجودی: {product['stock']}\n"
+        f"وضعیت: {status}"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ ویرایش قیمت", callback_data=f"edit_price_{product_id}"),
+            InlineKeyboardButton("📦 ویرایش موجودی", callback_data=f"edit_stock_{product_id}"),
+        ],
+        [InlineKeyboardButton(
+            "⏸ غیرفعال کردن" if product["is_active"] else "▶️ فعال کردن",
+            callback_data=f"toggle_product_{product_id}",
+        )],
+        [InlineKeyboardButton("🔙 فهرست محصولات", callback_data="admin_products")],
+    ]
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_admin_users(message):
+    users = get_all_users(limit=20)
+    if not users:
+        await message.reply_text("هنوز کاربری ثبت نشده است.")
+        return
+
+    rows = []
+    for item in users:
+        name = item["first_name"] or str(item["telegram_id"])
+        mark = "🚫" if item["is_banned"] else "👤"
+        rows.append([InlineKeyboardButton(
+            f"{mark} {name} ({item['telegram_id']})",
+            callback_data=f"admin_user_{item['telegram_id']}",
+        )])
+    rows.append([InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")])
+    await message.reply_text("👥 انتخاب کاربر:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_admin_user(message, user_id):
+    with get_connection() as db:
+        item = db.execute(
+            "SELECT telegram_id, username, first_name, wallet_balance, is_banned "
+            "FROM users WHERE telegram_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not item:
+        await message.reply_text("کاربر پیدا نشد.")
+        return
+
+    status = "مسدود" if item["is_banned"] else "فعال"
+    username = f"@{item['username']}" if item["username"] else "ندارد"
+    action = "unban" if item["is_banned"] else "ban"
+    label = "✅ رفع مسدودیت" if item["is_banned"] else "🚫 مسدود کردن"
+    await message.reply_text(
+        f"👤 کاربر {item['first_name'] or '-'}\n"
+        f"شناسه: {item['telegram_id']}\nنام کاربری: {username}\n"
+        f"موجودی کیف پول: {item['wallet_balance']:,} تومان\nوضعیت: {status}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, callback_data=f"{action}_{user_id}")],
+            [InlineKeyboardButton("🔙 فهرست کاربران", callback_data="admin_users")],
+        ]),
     )
 
-    await update.message.reply_text(
-        text,
-        reply_markup=main_menu()
+
+async def show_admin_stats(message):
+    stats = get_dashboard_statistics()
+    await message.reply_text(
+        "📊 آمار VitoPlus\n\n"
+        f"👥 کاربران: {stats['users']['total']} (مسدود: {stats['users']['banned']})\n"
+        f"📦 محصولات: {stats['products']['total']} (فعال: {stats['products']['active']})\n"
+        f"🧩 موجودی: {stats['products']['total_stock']}\n"
+        f"🛍 سفارش‌ها: {stats['orders']['total']}\n"
+        f"✅ تکمیل‌شده: {stats['orders']['completed']}\n"
+        f"⌛ در انتظار: {stats['orders']['pending']}\n"
+        f"⭐ خریدهای Stars: {stats['stars']['total']}\n"
+        f"💰 ورودی کیف پول: {stats['transactions']['positive_amount']:,} تومان\n"
+        f"💸 خروجی کیف پول: {stats['transactions']['negative_amount']:,} تومان",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")
+        ]]),
     )
 
 
-# -------------------- مدیریت دکمه‌ها --------------------
+async def show_admin_list(message):
+    admins = get_active_admins()
+    if not admins:
+        await message.reply_text("مدیر فعالی ثبت نشده است.")
+        return
+    lines = ["👮 مدیران فعال VitoPlus:\n"]
+    for item in admins:
+        lines.append(f"🆔 {item['telegram_id']} | نقش: {item['role']}")
+    await message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")
+        ]]),
+    )
 
-async def handle_buttons(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+
+# ----------------------------- Callback router -----------------------------
+
+async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    data = query.data or ""
+
+    # This handler answers its own callback query.
+    if data.startswith("buy_stars_"):
+        await buy_with_stars(update, context)
+        return
+
     await query.answer()
 
-    user_id = query.from_user.id
-    data = query.data
-
-    if data == "home":
-        await query.edit_message_text(
-            "به منوی اصلی VitoPlus خوش اومدی ❤️",
-            reply_markup=main_menu()
-        )
-
-    elif data == "buy":
+    if data == "buy":
+        context.user_data.pop("support_waiting", None)
         await show_products(query)
-
-    elif data == "account":
-        with get_connection() as db:
-            user = db.execute(
-                "SELECT wallet_balance FROM users WHERE telegram_id = ?",
-                (user_id,)
-            ).fetchone()
-
-        balance = user["wallet_balance"] if user else 0
-
-        keyboard = [
-            [InlineKeyboardButton("💳 شارژ کیف پول", callback_data="wallet_charge")],
-            [InlineKeyboardButton("🧾 لیست تراکنش‌ها", callback_data="transactions")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="home")],
-        ]
-
-        await query.edit_message_text(
-            f"👛 حساب کاربری شما\n\n"
-            f"💰 موجودی کیف پول: {balance:,} تومان",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif data == "wallet_charge":
-        await query.edit_message_text(
-            "💳 بخش شارژ کیف پول\n\n"
-            "این بخش در مرحله بعدی تکمیل می‌شه.",
-            reply_markup=back_menu()
-        )
-
-    elif data == "orders":
-        await query.edit_message_text(
-            "📦 خریدهای شما\n\n"
-            "هنوز سفارشی برای نمایش وجود نداره.",
-            reply_markup=back_menu()
-        )
-
-    elif data == "transactions":
-        await query.edit_message_text(
-            "🧾 تراکنش‌های شما\n\n"
-            "هنوز تراکنشی ثبت نشده.",
-            reply_markup=back_menu()
-        )
-
-    elif data == "referrals":
-        await query.edit_message_text(
-            "👥 دعوت دوستان\n\n"
-            "بخش دعوت دوستان در مرحله بعدی تکمیل می‌شه.",
-            reply_markup=back_menu()
-        )
-
-    elif data == "support":
-        await query.edit_message_text(
-            "💬 پشتیبانی\n\n"
-            "بخش پشتیبانی در مرحله بعدی تکمیل می‌شه.",
-            reply_markup=back_menu()
-        )
-
-    elif data == "guide":
-        await query.edit_message_text(
-            "ℹ️ راهنمای خرید\n\n"
-            "از بخش خرید کانفیگ، محصول موردنظرت رو انتخاب کن.\n"
-            "قبل از هر خرید، جزئیات سفارش و مبلغ نهایی بهت نمایش داده می‌شه.",
-            reply_markup=back_menu()
-        )
-
     elif data.startswith("product_"):
-        product_id = int(data.split("_")[1])
+        try:
+            product_id = int(data.rsplit("_", 1)[1])
+        except (TypeError, ValueError):
+            await query.edit_message_text("شناسه محصول معتبر نیست.")
+            return
+        await show_product(query, product_id)
+    elif data == "main":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "🏠 منوی اصلی VitoPlus\n\nیکی از بخش‌های زیر رو انتخاب کن:",
+            reply_markup=main_menu(),
+        )
+    elif data == "wallet":
+        await show_wallet(update, context)
+    elif data == "account":
+        await account(update, context)
+    elif data == "orders":
+        await user_orders(update, context)
+    elif data == "transactions":
+        await transactions(update, context)
+    elif data == "referrals":
+        await referrals(update, context)
+    elif data == "support":
+        context.user_data["support_waiting"] = True
+        await support(update, context)
+    elif data == "guide":
+        await query.message.reply_text(
+            "📖 راهنمای VitoPlus\n\n"
+            "۱. از بخش خرید سرویس، محصولات موجود را ببین.\n"
+            "۲. محصول را انتخاب کن.\n"
+            "۳. اگر پرداخت Stars فعال باشد، دکمه خرید نمایش داده می‌شود.\n"
+            "۴. پس از پرداخت موفق، کانفیگ در همین گفت‌وگو ارسال می‌شود.\n"
+            "۵. سفارش‌ها و تراکنش‌ها از منوی اصلی قابل مشاهده‌اند.",
+            reply_markup=main_menu(),
+        )
+    elif data == "cancel":
+        context.user_data.clear()
+        await query.message.reply_text("عملیات لغو شد.", reply_markup=main_menu())
 
-        with get_connection() as db:
-            product = db.execute(
-                "SELECT * FROM products WHERE id = ? AND is_active = 1",
-                (product_id,)
-            ).fetchone()
-
-        if product is None:
-            await query.edit_message_text(
-                "این محصول در دسترس نیست.",
-                reply_markup=back_menu()
-            )
+    # Admin-only routes
+    elif data in {
+        "admin", "admin_users", "admin_orders", "admin_logs",
+        "admin_products", "admin_stats", "admin_manage",
+    } or data.startswith(("admin_product_", "admin_user_", "edit_price_",
+                          "edit_stock_", "toggle_product_", "ban_", "unban_")):
+        if not is_admin(user.id):
+            await query.message.reply_text("⛔ دسترسی غیرمجاز.")
             return
 
-        if product["stock"] <= 0:
-            await query.edit_message_text(
-                "❌ این محصول موقتاً ناموجوده.\n\n"
-                "لطفاً محصول دیگری انتخاب کنید یا از گزینه حجم دلخواه استفاده کنید. ❤️",
-                reply_markup=back_menu()
-            )
-            return
-
-        await query.edit_message_text(
-            f"محصول: {product['name']}\n"
-            f"حجم: {product['volume_gb']} گیگابایت\n"
-            f"قیمت: {product['price']:,} تومان\n"
-            f"اعتبار: ۳۰ روز\n\n"
-            "بخش تأیید سفارش در مرحله بعدی تکمیل می‌شه.",
-            reply_markup=back_menu()
-        )
-
-    elif data == "custom_volume":
-        await query.edit_message_text(
-            "📦 خرید حجم دلخواه\n\n"
-            "این بخش در مرحله بعدی تکمیل می‌شه.",
-            reply_markup=back_menu()
-        )
-
-
-# -------------------- نمایش محصولات --------------------
-
-async def show_products(query):
-    with get_connection() as db:
-        products = db.execute("""
-            SELECT id, name, volume_gb, price, stock
-            FROM products
-            WHERE is_active = 1
-            ORDER BY volume_gb ASC
-        """).fetchall()
-
-    keyboard = []
-
-    for product in products:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{product['name']} | {product['volume_gb']}GB",
-                callback_data=f"product_{product['id']}"
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "📦 خرید حجم دلخواه",
-            callback_data="custom_volume"
-        )
-    ])
-
-    keyboard.append([
-        InlineKeyboardButton("🔙 بازگشت", callback_data="home")
-    ])
-
-    if not products:
-        text = (
-            "🛒 در حال حاضر محصول آماده‌ای برای فروش وجود نداره.\n\n"
-            "می‌تونی از گزینه خرید حجم دلخواه استفاده کنی."
-        )
+        if data == "admin":
+            await admin_panel(update, context)
+        elif data == "admin_users":
+            await show_admin_users(query.message)
+        elif data == "admin_orders":
+            await admin_orders(update, context)
+        elif data == "admin_logs":
+            await admin_logs(update, context)
+        elif data == "admin_products":
+            await show_admin_products(query.message)
+        elif data == "admin_stats":
+            await show_admin_stats(query.message)
+        elif data == "admin_manage":
+            await show_admin_list(query.message)
+        elif data.startswith("admin_product_"):
+            await show_admin_product(query.message, int(data.rsplit("_", 1)[1]))
+        elif data.startswith("admin_user_"):
+            await show_admin_user(query.message, int(data.rsplit("_", 1)[1]))
+        elif data.startswith("edit_price_"):
+            product_id = int(data.rsplit("_", 1)[1])
+            context.user_data.clear()
+            context.user_data["admin_input"] = "price"
+            context.user_data["admin_product_id"] = product_id
+            await query.message.reply_text("قیمت جدید را به تومان و فقط به‌صورت عدد بفرست. برای لغو /cancel را بزن.")
+        elif data.startswith("edit_stock_"):
+            product_id = int(data.rsplit("_", 1)[1])
+            product = get_product_details(product_id)
+            if not product:
+                await query.message.reply_text("محصول پیدا نشد.")
+            elif product["product_type"] == "digital":
+                await query.message.reply_text(
+                    "موجودی محصول دیجیتال از تعداد کانفیگ‌های ثبت‌شده محاسبه می‌شود؛ "
+                    "ویرایش عددی موجودی برای آن مجاز نیست."
+                )
+            else:
+                context.user_data.clear()
+                context.user_data["admin_input"] = "stock"
+                context.user_data["admin_product_id"] = product_id
+                await query.message.reply_text("موجودی جدید را به‌صورت عدد صحیح بفرست. برای لغو /cancel را بزن.")
+        elif data.startswith("toggle_product_"):
+            product_id = int(data.rsplit("_", 1)[1])
+            product = get_product_details(product_id)
+            if product:
+                set_product_active(product_id, not bool(product["is_active"]))
+                audit(user.id, "toggle_product", f"product_id={product_id}")
+                await show_admin_product(query.message, product_id)
+        elif data.startswith("ban_"):
+            target_id = int(data.rsplit("_", 1)[1])
+            if set_user_ban(target_id, True):
+                audit(user.id, "ban_user", f"user_id={target_id}")
+            await show_admin_user(query.message, target_id)
+        elif data.startswith("unban_"):
+            target_id = int(data.rsplit("_", 1)[1])
+            if set_user_ban(target_id, False):
+                audit(user.id, "unban_user", f"user_id={target_id}")
+            await show_admin_user(query.message, target_id)
     else:
-        text = "🛒 محصولات موجود\n\nمحصول موردنظرت رو انتخاب کن:"
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        await query.message.reply_text(
+            "این گزینه هنوز فعال نشده است.", reply_markup=main_menu()
+        )
 
 
-def back_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="home")]
-    ])
+# ----------------------------- Incoming messages -----------------------------
+
+async def incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    if context.user_data.get("admin_input"):
+        if not is_admin(user.id):
+            context.user_data.clear()
+            await message.reply_text("⛔ دسترسی غیرمجاز.")
+            return
+        raw = (message.text or "").strip()
+        if not raw.isdigit():
+            await message.reply_text("فقط عدد صحیح و مثبت بفرست. برای لغو /cancel را بزن.")
+            return
+        value = int(raw)
+        if value <= 0:
+            await message.reply_text("عدد باید بیشتر از صفر باشد.")
+            return
+
+        action = context.user_data.get("admin_input")
+        product_id = context.user_data.get("admin_product_id")
+        if action == "price":
+            ok, result = update_product(product_id, price=value)
+            if ok:
+                audit(user.id, "edit_product_price", f"product_id={product_id}; price={value}")
+                context.user_data.clear()
+                await message.reply_text("✅ قیمت محصول به‌روزرسانی شد.")
+                await show_admin_product(message, product_id)
+            else:
+                await message.reply_text(str(result))
+        elif action == "stock":
+            ok = set_product_stock(product_id, value)
+            if ok:
+                audit(user.id, "edit_product_stock", f"product_id={product_id}; stock={value}")
+                context.user_data.clear()
+                await message.reply_text("✅ موجودی محصول به‌روزرسانی شد.")
+                await show_admin_product(message, product_id)
+            else:
+                await message.reply_text("❌ تغییر موجودی انجام نشد.")
+        return
+
+    if context.user_data.get("support_waiting"):
+        await handle_support_message(update, context)
+        return
+
+    if message.text:
+        await message.reply_text(
+            "برای شروع از /start استفاده کن یا یکی از گزینه‌های منو رو انتخاب کن.",
+            reply_markup=main_menu(),
+        )
 
 
-# -------------------- اجرای ربات --------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    if error is not None:
+        logger.error(
+            "Unhandled exception while processing update: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
-def main():
+
+# ----------------------------- Application startup -----------------------------
+
+def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN در فایل .env تنظیم نشده است."
+            "BOT_TOKEN پیدا نشد. آن را در فایل .env یا متغیرهای محیطی تنظیم کن."
         )
 
     initialize_database()
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+
+    application.add_handler(PreCheckoutQueryHandler(pre_checkout))
     application.add_handler(
-        CallbackQueryHandler(handle_buttons)
+        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment)
     )
+    application.add_handler(CallbackQueryHandler(route_callback))
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+            incoming_message,
+        )
+    )
+    application.add_error_handler(error_handler)
+    return application
 
-    logger.info("VitoPlus bot is starting...")
 
-    application.run_polling()
+def main():
+    application = build_application()
+    logger.info("VitoPlus is starting...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == "__main__":

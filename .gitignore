@@ -1,16 +1,17 @@
-.venv/
-venv/
-__pycache__/
-*.pyc
-
 .env
 .env.*
 !.env.example
+
+.venv/
+venv/
+pycache/
+*.pyc
 
 vitoplus.db
 *.db
 *.sqlite
 *.sqlite3
 
+*.zip
 .idea/
 .vscode/

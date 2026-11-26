@@ -1,0 +1,36 @@
+# نام ربات
+BOT_NAME = "v2PLUS"
+
+# تنظیمات خرید
+DEFAULT_CONFIG_VALIDITY_DAYS = 30
+DEFAULT_CUSTOM_VOLUME_MAX = 100
+
+# قیمت‌گذاری حجم سفارشی بر حسب تومان
+CUSTOM_VOLUME_FIRST_LIMIT = 30
+CUSTOM_VOLUME_FIRST_PRICE = 3000
+CUSTOM_VOLUME_EXTRA_PRICE = 2000
+
+# وضعیت سفارش‌ها
+ORDER_PENDING = "pending"
+ORDER_COMPLETED = "completed"
+ORDER_CANCELLED = "cancelled"
+ORDER_FAILED = "failed"
+ORDER_REFUNDED = "refunded"
+
+# نوع تراکنش‌ها
+TRANSACTION_DEPOSIT = "deposit"
+TRANSACTION_PURCHASE = "purchase"
+TRANSACTION_REFUND = "refund"
+TRANSACTION_REFERRAL = "referral"
+TRANSACTION_ADMIN_ADJUSTMENT = "admin_adjustment"
+
+# محدودیت نمایش اطلاعات
+DEFAULT_TRANSACTION_LIMIT = 10
+DEFAULT_ORDER_LIMIT = 10
+DEFAULT_USER_LIMIT = 50
+DEFAULT_ADMIN_LOG_LIMIT = 30
+
+# نقش‌های مدیریتی
+ROLE_OWNER = "owner"
+ROLE_ADMIN = "admin"
+ROLE_SUPPORT = "support"
